@@ -10,7 +10,7 @@ from mangum import Mangum
 app = FastAPI(
     title="Tax Network Analysis API",
     description="Backend Serverless untuk Klasterisasi Hubungan Kepemilikan Saham Wajib Pajak",
-    version="1.0.0"
+    version="1.0.1"
 )
 
 # Enable CORS so your React Frontend can securely communicate with this API
@@ -29,7 +29,6 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 BACKEND_DIR = os.path.dirname(CURRENT_DIR)
 ROOT_DIR = os.path.dirname(BACKEND_DIR)
 
-# System checks multiple absolute paths to ensure Serverless Python always finds the data
 paths_to_try_nodes = [
     os.path.join(BACKEND_DIR, "data", "nodes_masked.csv"),
     os.path.join(ROOT_DIR, "data", "nodes_masked.csv"),
@@ -47,7 +46,6 @@ paths_to_try_edges = [
 df_nodes = None
 df_edges = None
 
-# Loop to find and open the CSV files
 for p_node, p_edge in zip(paths_to_try_nodes, paths_to_try_edges):
     try:
         if os.path.exists(p_node) and os.path.exists(p_edge):
@@ -78,17 +76,16 @@ if df_nodes is None or df_edges is None:
 # AUTHENTICATION SECURITY LAYER
 # ==============================================================================
 def verify_password(x_app_password: str = Header(None)):
-    """Verifikasi kecocokan password yang dikirim frontend dengan Environment Variable Vercel."""
     secure_password = os.environ.get("APP_PASSWORD", "default_fallback_password")
     if x_app_password != secure_password:
         raise HTTPException(status_code=401, detail="Unauthorized: Invalid App Password")
     return True
 
 # ==============================================================================
-# MAIN CORE NETWORK ROUTE
+# MAIN CORE NETWORK ROUTE (PERBAIKAN TYPE DATA STR/INT)
 # ==============================================================================
 @app.get("/api/network", dependencies=[Depends(verify_password)])
-def get_network(target_id: int = None, min_percentage: float = 0.0, node_type: str = "Semua"):
+def get_network(target_id: str = None, min_percentage: float = 0.0, node_type: str = "Semua"):
     """
     Endpoint Utama: Memfilter relasi, mendeteksi komunitas/grup dengan Louvain,
     dan memetakan ekosistem (2-hop jika target_id diisi).
@@ -115,6 +112,7 @@ def get_network(target_id: int = None, min_percentage: float = 0.0, node_type: s
         return []
 
     # 3. Bangun Struktur Graf Jaringan menggunakan python-igraph
+    # Catatan: Fungsi ini mengubah ID sumber & target menjadi String di dalam graf (g.vs['name'])
     g = ig.Graph.TupleList(
         filtered_edges[['sumber', 'target', 'persentase', 'nilai', 'dividen', 'jenis_relasi']].itertuples(index=False),
         directed=True,
@@ -129,16 +127,22 @@ def get_network(target_id: int = None, min_percentage: float = 0.0, node_type: s
     community_map = {}
     for cluster_idx, cluster in enumerate(communities):
         for vertex_idx in cluster:
-            node_name_id = g.vs[vertex_idx]['name']
+            node_name_id = str(g.vs[vertex_idx]['name'])
             community_map[node_name_id] = f"Group_{cluster_idx + 1}"
 
     # 5. Fokus Analisis Berbasis Target Pajak (Fokus 2-Hop Network)
     nodes_to_include = set(g.vs['name'])
-    if target_id and target_id in g.vs['name']:
-        v_idx = g.vs.find(name=target_id).index
-        # neighborhood order 2 mencakup anak-perusahaan dan induk (2 level relasi dari target)
-        neighbors = g.neighborhood(vertices=v_idx, order=2, mode="all")
-        nodes_to_include = set([g.vs[n]['name'] for n in neighbors])
+    
+    if target_id:
+        target_str = str(target_id).strip()
+        if target_str in g.vs['name']:
+            v_idx = g.vs.find(name=target_str).index
+            # neighborhood order 2 mencakup anak-perusahaan dan induk (2 level relasi dari target)
+            neighbors = g.neighborhood(vertices=v_idx, order=2, mode="all")
+            nodes_to_include = set([g.vs[n]['name'] for n in neighbors])
+        else:
+            # Jika target_id diisi tetapi tidak ditemukan di dalam relasi graf terfilter
+            return []
 
     # 6. Susun Struktur Output Data ke Format Cytoscape.js JSON
     cytoscape_elements = []
@@ -146,15 +150,20 @@ def get_network(target_id: int = None, min_percentage: float = 0.0, node_type: s
     
     # Tambahkan Simpul/Lingkaran (Nodes)
     for v in g.vs:
-        if v['name'] not in nodes_to_include:
+        node_name_str = str(v['name'])
+        if node_name_str not in nodes_to_include:
             continue
             
-        node_id = int(v['name'])
-        node_info = df_nodes_filtered[df_nodes_filtered['id'] == node_id]
+        try:
+            node_id_int = int(node_name_str)
+        except ValueError:
+            node_id_int = node_name_str
+            
+        node_info = df_nodes_filtered[df_nodes_filtered['id'] == node_id_int]
         
-        nama_wp = node_info['nama'].values[0] if not node_info.empty else f"WP ID {node_id}"
+        nama_wp = node_info['nama'].values[0] if not node_info.empty else f"WP ID {node_name_str}"
         jenis_wp = node_info['jenis_node'].values[0] if not node_info.empty else "Badan"
-        group_id = community_map.get(node_id, "Tanpa_Grup")
+        group_id = community_map.get(node_name_str, "Tanpa_Grup")
         
         # Buat Kotak Induk (Parent Compound Node) untuk mengelompokkan grup konglomerasi
         if group_id not in added_groups:
@@ -170,7 +179,7 @@ def get_network(target_id: int = None, min_percentage: float = 0.0, node_type: s
         # Buat Lingkaran Anggota Perusahaan/Orang Pribadi
         cytoscape_elements.append({
             "data": {
-                "id": str(node_id),
+                "id": node_name_str,
                 "label": nama_wp,
                 "parent": group_id,
                 "jenis_node": jenis_wp,
@@ -180,18 +189,18 @@ def get_network(target_id: int = None, min_percentage: float = 0.0, node_type: s
 
     # Tambahkan Garis Hubungan/Kepemilikan (Edges)
     for e in g.es:
-        source_node = g.vs[e.source]['name']
-        target_node = g.vs[e.target]['name']
+        source_node_str = str(g.vs[e.source]['name'])
+        target_node_str = str(g.vs[e.target]['name'])
         
-        if source_node in nodes_to_include and target_node in nodes_to_include:
+        if source_node_str in nodes_to_include and target_node_str in nodes_to_include:
             cytoscape_elements.append({
                 "data": {
-                    "id": f"e_{source_node}_{target_node}",
-                    "source": str(source_node),
-                    "target": str(target_node),
+                    "id": f"e_{source_node_str}_{target_node_str}",
+                    "source": source_node_str,
+                    "target": target_node_str,
                     "label": f"{e['persentase']}%",
-                    "nilai": float(e['nilai']),
-                    "dividen": float(e['dividen']),
+                    "nilai": float(e['nilai']) if e['nilai'] else 0.0,
+                    "dividen": float(e['dividen']) if e['dividen'] else 0.0,
                     "jenis_relasi": e['jenis_relasi']
                 }
             })
@@ -204,6 +213,6 @@ def health_check():
     return {"status": "healthy", "nodes_loaded": len(df_nodes) if df_nodes is not None else 0}
 
 # ==============================================================================
-# VERCEL SERVERLESS HANDLER WRAAPPER
+# VERCEL SERVERLESS HANDLER WRAPPER
 # ==============================================================================
 handler = Mangum(app)
